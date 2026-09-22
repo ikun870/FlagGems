@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 import triton
@@ -418,6 +419,193 @@ def get_higher_dtype(a, b):
             return a
 
 
+# ---------------------------------------------------------------------------
+# 小 M（decode）专用 GEMM 路径
+#
+# 动机：decode 一步的 4 个投影 GEMM 都是「M = 并发数」（本地 64）的瘦长形状。
+#   CTA 数 = (M / BLOCK_M) x (N / BLOCK_N)，M 被并发数钉死后，并行度只能由 N 撑。
+#   FlagGems 现有 tune_configs 里 BLOCK_N 最小为 64，于是 N=2048 的 o_proj / down_proj
+#   只剩 16~32 个 CTA，跑在 114 个 SM 上，实测权重读取带宽仅为硬件上限的 5~6 成。
+#   本路径在 M <= 64 时跳过 autotune，直接指定实测最优 tile
+#   （BLOCK_M=64 / BLOCK_N=32 / BLOCK_K=128 / num_stages=3 / num_warps=4），
+#   把 CTA 数撑大 2~4 倍。
+# ---------------------------------------------------------------------------
+# 开关（**源码字面量**，由 scripts/mm_level_arm.py 改写）
+#
+#     FLAGOS_SMALL_M_MM_LEVEL = 0  → 关闭，走原 general_mm 路径（A/B 对照臂）
+#     FLAGOS_SMALL_M_MM_LEVEL = 1  → 开启（默认，提交状态）
+#
+#   为什么不用环境变量：vLLM 是多进程结构，环境变量的读取点可能落在 worker
+#   子进程里，父进程设的值不保证传得到 —— 一旦读不到，两臂就会跑成同一配置，
+#   把方差当效应。源码字面量不存在这个问题（每个进程 import 的都是同一份源码）。
+#
+#   生效留痕：import 时 + 首次命中时 + 每 50000 次命中时，向
+#   FLAGOS_SMALL_M_MM_TRACE 追加一行「kind pid= level= enabled= n=」。
+#   必须写文件而不是 logger：worker 子进程里 logger 没有 handler，
+#   logger.info 不会出现在任何日志里（此前踩过这个坑）。
+# ---------------------------------------------------------------------------
+FLAGOS_SMALL_M_MM_LEVEL = 1
+
+SMALL_M_MM_ENABLED = FLAGOS_SMALL_M_MM_LEVEL >= 1
+SMALL_M_MAX = 64
+SMALL_M_BLOCK_M = 64
+SMALL_M_BLOCK_N = 32
+SMALL_M_BLOCK_K = 128
+SMALL_M_NUM_WARPS = 4
+SMALL_M_NUM_STAGES = 3
+
+# 留痕文件（每进程一行；A/B 期间由臂脚本先清空再回读）
+FLAGOS_SMALL_M_MM_TRACE = "/tmp/flagos_small_m_mm_applied.log"
+_FL_SMALL_M_NCALLS = 0
+
+
+def _fl_small_m_trace(kind, n=0):
+    """把「开关取值 + 进程号 + 命中次数」写进留痕文件（失败静默）。"""
+    if not FLAGOS_SMALL_M_MM_TRACE:
+        return
+    try:
+        with open(FLAGOS_SMALL_M_MM_TRACE, "a") as f:
+            f.write(
+                "%s pid=%d level=%d enabled=%d n=%d\n"
+                % (kind, os.getpid(), FLAGOS_SMALL_M_MM_LEVEL, int(SMALL_M_MM_ENABLED), n)
+            )
+    except Exception:
+        pass
+
+
+_fl_small_m_trace("import")
+
+
+@triton.jit
+def mm_kernel_small_m(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NEED_MASK_M: tl.constexpr,
+    NEED_MASK_N: tl.constexpr,
+    HAS_K_TAIL: tl.constexpr,
+):
+    # M <= 64 时 grid_m == 1，program id 直接按 N 方向展开；
+    # 不做 GROUP_M 重排（它只在 grid_m > 1 时才有意义）。
+    pid = ext.program_id(0)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rm_ok = rm < M
+    rn_ok = rn < N
+
+    # K 能整除 BLOCK_K 时（decode 的 K=2048/6144 都是），直接把主循环跑满，
+    # 不生成尾声 —— 否则那个非流水的尾声会打断 cp.async 流水线，实测拖慢约 1.7%。
+    if HAS_K_TAIL:
+        prev_multiple = prev_multiple_of(K, BLOCK_K)
+    else:
+        prev_multiple = K
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for start_k in range(0, prev_multiple, BLOCK_K):
+        rk = start_k + tl.arange(0, BLOCK_K)
+        a_ptrs = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
+        b_ptrs = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        if NEED_MASK_M:
+            a = tl.load(a_ptrs, mask=rm_ok[:, None], other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+        if NEED_MASK_N:
+            b = tl.load(b_ptrs, mask=rn_ok[None, :], other=0.0)
+        else:
+            b = tl.load(b_ptrs)
+        acc = tl.dot(a, b, acc)
+
+    if HAS_K_TAIL:
+        # K 方向余数（loop peeling），与 mm_kernel_general 保持一致
+        rk = prev_multiple + tl.arange(0, BLOCK_K)
+        mask_k = rk < K
+        a_ptrs = A + rm[:, None] * stride_am + rk[None, :] * stride_ak
+        b_ptrs = B + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+        if NEED_MASK_M:
+            a = tl.load(a_ptrs, mask=rm_ok[:, None] & mask_k[None, :], other=0.0)
+        else:
+            a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+        if NEED_MASK_N:
+            b = tl.load(b_ptrs, mask=mask_k[:, None] & rn_ok[None, :], other=0.0)
+        else:
+            b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+        acc = tl.dot(a, b, acc)
+
+    c_ptrs = C + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    if NEED_MASK_M or NEED_MASK_N:
+        tl.store(
+            c_ptrs,
+            acc.to(C.dtype.element_ty),
+            mask=rm_ok[:, None] & rn_ok[None, :],
+        )
+    else:
+        tl.store(c_ptrs, acc.to(C.dtype.element_ty))
+
+
+def small_m_mm_scenario(a, b, M, N, K):
+    """只有「M 很小 + 半精度」才走专用路径，其余一律回落原实现。"""
+    if not SMALL_M_MM_ENABLED:
+        return False
+    return (
+        0 < M <= SMALL_M_MAX
+        and a.dtype == b.dtype
+        and a.dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def general_mm_small_m(a, b, c, M, N, K):
+    BLOCK_M = SMALL_M_BLOCK_M
+    BLOCK_N = SMALL_M_BLOCK_N
+    BLOCK_K = SMALL_M_BLOCK_K
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    with torch_device_fn.device(a.device):
+        mm_kernel_small_m[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            NEED_MASK_M=(M % BLOCK_M != 0),
+            NEED_MASK_N=(N % BLOCK_N != 0),
+            HAS_K_TAIL=(K % BLOCK_K != 0),
+            num_warps=SMALL_M_NUM_WARPS,
+            num_stages=SMALL_M_NUM_STAGES,
+        )
+    # 命中计数留痕：**首次命中必记**（用来证明门控真的在真实服务链路里生效，
+    # 而不是只在离线微基准里生效），之后每 50000 次记一行。
+    global _FL_SMALL_M_NCALLS
+    _FL_SMALL_M_NCALLS += 1
+    if _FL_SMALL_M_NCALLS == 1 or _FL_SMALL_M_NCALLS % 50000 == 0:
+        _fl_small_m_trace("calls", _FL_SMALL_M_NCALLS)
+    return c
+
+
 def general_mm(a, b, c, M, N, K):
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
@@ -595,6 +783,8 @@ def mm(a, b):
         return streamk_mm(a, b, c, M, N, K, sm_count=sm_count)
     if cluster_remote_mm_scenario(a, b, c, M, N, K):
         return cluster_remote_mm(a, b, c, M, N, K)
+    if small_m_mm_scenario(a, b, M, N, K):
+        return general_mm_small_m(a, b, c, M, N, K)
     return general_mm(a, b, c, M, N, K)
 
 
@@ -619,6 +809,8 @@ def mm_out(a, b, *, out):
         return streamk_mm(a, b, out, M, N, K, sm_count=sm_count)
     if cluster_remote_mm_scenario(a, b, out, M, N, K):
         return cluster_remote_mm(a, b, out, M, N, K)
+    if small_m_mm_scenario(a, b, M, N, K):
+        return general_mm_small_m(a, b, out, M, N, K)
     return general_mm(a, b, out, M, N, K)
 
 
